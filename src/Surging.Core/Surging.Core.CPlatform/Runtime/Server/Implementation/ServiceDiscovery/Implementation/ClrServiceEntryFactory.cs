@@ -11,7 +11,14 @@ using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
+using Surging.Core.CPlatform.Validation;
 using static Surging.Core.CPlatform.Utilities.FastInvoke;
+using System.Threading;
+using System.Runtime.CompilerServices;
+using Surging.Core.CPlatform.Messages;
+using Surging.Core.CPlatform.Exceptions;
+using System.Collections.Concurrent;
+using Surging.Core.CPlatform.Ioc;
 
 namespace Surging.Core.CPlatform.Runtime.Server.Implementation.ServiceDiscovery.Implementation
 {
@@ -24,14 +31,18 @@ namespace Surging.Core.CPlatform.Runtime.Server.Implementation.ServiceDiscovery.
         private readonly CPlatformContainer _serviceProvider;
         private readonly IServiceIdGenerator _serviceIdGenerator;
         private readonly ITypeConvertibleService _typeConvertibleService;
+        private readonly IValidationProcessor _validationProcessor;
+        private readonly ConcurrentDictionary<string, ManualResetValueTaskSource<TransportMessage>> _resultDictionary =
+      new ConcurrentDictionary<string, ManualResetValueTaskSource<TransportMessage>>();
         #endregion Field
 
         #region Constructor
-        public ClrServiceEntryFactory(CPlatformContainer serviceProvider, IServiceIdGenerator serviceIdGenerator, ITypeConvertibleService typeConvertibleService)
+        public ClrServiceEntryFactory(CPlatformContainer serviceProvider, IServiceIdGenerator serviceIdGenerator, ITypeConvertibleService typeConvertibleService, IValidationProcessor validationProcessor)
         {
             _serviceProvider = serviceProvider;
             _serviceIdGenerator = serviceIdGenerator;
             _typeConvertibleService = typeConvertibleService;
+            _validationProcessor = validationProcessor;
         }
 
         #endregion Constructor
@@ -99,15 +110,21 @@ namespace Surging.Core.CPlatform.Runtime.Server.Implementation.ServiceDiscovery.
                     ?? AuthorizationType.AppSecret);
             }
             var fastInvoker = GetHandler(serviceId, method);
+
+            var methodValidateAttribute = attributes.Where(p => p is ValidateAttribute)
+                .Cast<ValidateAttribute>().FirstOrDefault();
+            var isReactive = attributes.Any(p => p is ReactiveAttribute);
             return new ServiceEntry
             {
                 Descriptor = serviceDescriptor,
                 RoutePath = serviceDescriptor.RoutePath,
                 Methods=httpMethods,
                 MethodName = method.Name,
+                Parameters = method.GetParameters(),
+                IsPermission = method.DeclaringType.GetCustomAttribute<BaseActionFilterAttribute>() != null || attributes.Any(p => p is BaseActionFilterAttribute),
                 Type = method.DeclaringType,
                 Attributes = attributes,
-                Func = (key, parameters) =>
+                Func = async (key, parameters) =>
              {
                  object instance = null;
                  if (AppConfig.ServerOptions.IsModulePerLifetimeScope)
@@ -124,17 +141,78 @@ namespace Surging.Core.CPlatform.Runtime.Server.Implementation.ServiceDiscovery.
                          list.Add(parameterInfo.DefaultValue);
                          continue;
                      }
+                     else if(parameterInfo.ParameterType == typeof(CancellationToken))
+                     {
+                         list.Add(new CancellationToken());
+                         continue;
+                     }
                      var value = parameters[parameterInfo.Name];
+
+                     if(methodValidateAttribute !=null)
+                     _validationProcessor.Validate(parameterInfo, value);
+
                      var parameterType = parameterInfo.ParameterType;
                      var parameter = _typeConvertibleService.Convert(value, parameterType);
                      list.Add(parameter);
                  }
-                 var result = fastInvoker(instance, list.ToArray());
-                 return Task.FromResult(result);
+                 if (!isReactive)
+                 {
+                     var result = fastInvoker(instance, list.ToArray());
+                     return await Task.FromResult(result);
+                 }
+                 else
+                 {
+                     var serviceBehavior = instance as IServiceBehavior;
+                     var callbackTask = RegisterResultCallbackAsync(serviceBehavior.MessageId, Task.Factory.CancellationToken);
+                     serviceBehavior.Received += MessageListener_Received;
+                     var result = fastInvoker(instance, list.ToArray());
+                     return await callbackTask;
+                 }
              }
             };
         }
-        
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private async Task<object> RegisterResultCallbackAsync(string id, CancellationToken cancellationToken)
+        {
+
+            var task = new ManualResetValueTaskSource<TransportMessage>();
+            _resultDictionary.TryAdd(id, task);
+            try
+            {
+                var result = await task.AwaitValue(cancellationToken);
+                return result.GetContent<ReactiveResultMessage>()?.Result;
+            }
+            finally
+            {
+                //删除回调任务
+                ManualResetValueTaskSource<TransportMessage> value;
+                _resultDictionary.TryRemove(id, out value);
+                value.SetCanceled();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private async Task MessageListener_Received(TransportMessage message)
+        {
+            ManualResetValueTaskSource<TransportMessage> task;
+            if (!_resultDictionary.TryGetValue(message.Id, out task))
+                return;
+
+            if (message.IsReactiveMessage())
+            {
+                var content = message.GetContent<ReactiveResultMessage>();
+                if (!string.IsNullOrEmpty(content.ExceptionMessage))
+                {
+                    task.SetException(new CPlatformCommunicationException(content.ExceptionMessage, content.StatusCode));
+                }
+                else
+                {
+                    task.SetResult(message);
+                }
+            }
+        }
+
         private FastInvokeHandler GetHandler(string key, MethodInfo method)
         {
             var objInstance = ServiceResolver.Current.GetService(null, key);

@@ -10,6 +10,7 @@ using Surging.Core.CPlatform.Module;
 using Surging.Core.KestrelHttpServer;
 using Surging.Core.KestrelHttpServer.Extensions;
 using Surging.Core.KestrelHttpServer.Filters;
+using Surging.Core.KestrelHttpServer.Internal;
 using Surging.Core.Stage.Configurations;
 using Surging.Core.Stage.Filters;
 using Surging.Core.Stage.Internal;
@@ -18,6 +19,7 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Text;
+using System.Text.Json;
 
 namespace Surging.Core.Stage
 {
@@ -41,6 +43,7 @@ namespace Surging.Core.Stage
             {
                 context.Builder.UseCors(builder =>
                 {
+                    if(policy.Origins!=null)
                     builder.WithOrigins(policy.Origins);
                     if (policy.AllowAnyHeader)
                         builder.AllowAnyHeader();
@@ -66,7 +69,8 @@ namespace Surging.Core.Stage
                 ApiGateWay.AppConfig.TokenEndpointPath = apiConfig.TokenEndpointPath;
             }
             context.Services.AddMvc().AddJsonOptions(options => {
-                options.SerializerSettings.DateFormatString = "yyyy-MM-dd HH:mm:ss";
+                options.JsonSerializerOptions.Converters.Add(new DateTimeConverter());
+                options.JsonSerializerOptions.Converters.Add(new DateTimeNullConverter());
                 if (AppConfig.Options.IsCamelCaseResolver)
                 {
                     JsonConvert.DefaultSettings= new Func<JsonSerializerSettings>(() =>
@@ -76,7 +80,7 @@ namespace Surging.Core.Stage
                         setting.ContractResolver = new CamelCasePropertyNamesContractResolver();
                         return setting;
                     });
-                    options.SerializerSettings.ContractResolver = new CamelCasePropertyNamesContractResolver();
+                    options.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
                 }
                 else
                 {
@@ -87,10 +91,10 @@ namespace Surging.Core.Stage
                         setting.ContractResolver= new DefaultContractResolver();
                         return setting;
                     });
-                    options.SerializerSettings.ContractResolver = new DefaultContractResolver();
+                    options.JsonSerializerOptions.PropertyNamingPolicy = null;
                 }
             });
-            context.Services.AddSingleton<IHttpContextAccessor,HttpContextAccessor>();
+          
             context.Services.AddSingleton<IIPChecker,IPAddressChecker>();
             context.Services.AddFilters(typeof(AuthorizationFilterAttribute));
             context.Services.AddFilters(typeof(ActionFilterAttribute));

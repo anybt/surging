@@ -7,6 +7,7 @@ using Surging.Core.CPlatform.Transport.Implementation;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Reactive.Subjects;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -16,12 +17,23 @@ namespace Surging.Core.KestrelHttpServer
     {
         private readonly ISerializer<string> _serializer;
         private readonly HttpContext _context;
-       public  HttpServerMessageSender(ISerializer<string> serializer,HttpContext httpContext)
+        private readonly DiagnosticListener _diagnosticListener;
+        private readonly ReplaySubject<HttpResultMessage<Object>> _subject = null;
+        public  HttpServerMessageSender(ISerializer<string> serializer,HttpContext httpContext)
         {
             _serializer = serializer;
             _context = httpContext;
+            _diagnosticListener = new DiagnosticListener(DiagnosticListenerExtensions.DiagnosticListenerName);
         }
-        
+
+        internal HttpServerMessageSender(ISerializer<string> serializer, HttpContext httpContext, DiagnosticListener diagnosticListener, ReplaySubject<HttpResultMessage<Object>> subject)
+        {
+            _serializer = serializer;
+            _context = httpContext;
+            _diagnosticListener = diagnosticListener;
+            _subject = subject;
+        }
+
         public async Task SendAndFlushAsync(TransportMessage message)
         { 
             var httpMessage = message.GetContent<HttpResultMessage<Object>>();
@@ -44,6 +56,8 @@ namespace Surging.Core.KestrelHttpServer
                     Message = message
                 });
             }
+            if (_subject != null)
+                _subject.OnNext(httpMessage);
         }
 
         public async Task SendAsync(TransportMessage message)
@@ -55,11 +69,11 @@ namespace Surging.Core.KestrelHttpServer
         {
             if (!CPlatform.AppConfig.ServerOptions.DisableDiagnostic)
             {
-                var diagnosticListener = new DiagnosticListener(DiagnosticListenerExtensions.DiagnosticListenerName);
+            
                 var remoteInvokeResultMessage = message.GetContent<HttpResultMessage>();
                 if (remoteInvokeResultMessage.IsSucceed)
                 {
-                    diagnosticListener.WriteTransportAfter(TransportType.Rest, new ReceiveEventData(new DiagnosticMessage
+                    _diagnosticListener.WriteTransportAfter(TransportType.Rest, new ReceiveEventData(new DiagnosticMessage
                     {
                         Content = message.Content,
                         ContentType = message.ContentType,
@@ -68,7 +82,7 @@ namespace Surging.Core.KestrelHttpServer
                 }
                 else
                 {
-                    diagnosticListener.WriteTransportError(TransportType.Rest, new TransportErrorEventData(new DiagnosticMessage
+                    _diagnosticListener.WriteTransportError(TransportType.Rest, new TransportErrorEventData(new DiagnosticMessage
                     {
                         Content = message.Content,
                         ContentType = message.ContentType,

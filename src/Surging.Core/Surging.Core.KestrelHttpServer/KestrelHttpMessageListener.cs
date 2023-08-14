@@ -24,7 +24,10 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Surging.Core.KestrelHttpServer.Filters;
 using Surging.Core.CPlatform.Messages;
 using System.Diagnostics;
+using Surging.Core.CPlatform.Configurations;
 using Surging.Core.CPlatform.Diagnostics;
+using Surging.Core.CPlatform.Utilities;
+using System.Reactive.Subjects;
 
 namespace Surging.Core.KestrelHttpServer
 {
@@ -38,6 +41,7 @@ namespace Surging.Core.KestrelHttpServer
         private readonly IModuleProvider _moduleProvider;
         private readonly CPlatformContainer _container;
         private readonly IServiceRouteProvider _serviceRouteProvider;
+        private readonly DiagnosticListener _diagnosticListener;
 
         public KestrelHttpMessageListener(ILogger<KestrelHttpMessageListener> logger,
             ISerializer<string> serializer, 
@@ -52,12 +56,18 @@ namespace Surging.Core.KestrelHttpServer
             _moduleProvider = moduleProvider;
             _container = container;
             _serviceRouteProvider = serviceRouteProvider;
+            _diagnosticListener = new DiagnosticListener(CPlatform.Diagnostics.DiagnosticListenerExtensions.DiagnosticListenerName);
         }
 
         public async Task StartAsync(IPAddress address,int? port)
         { 
             try
             {
+                if (AppConfig.ServerOptions.DockerDeployMode == DockerDeployMode.Swarm)
+                {
+                    address = IPAddress.Any;
+                }
+
                 var hostBuilder = new WebHostBuilder()
                   .UseContentRoot(Directory.GetCurrentDirectory())
                   .UseKestrel((context,options) =>
@@ -106,7 +116,7 @@ namespace Surging.Core.KestrelHttpServer
         public void ConfigureServices(IServiceCollection services)
         { 
             var builder = new ContainerBuilder();
-            services.AddMvc();
+            services.AddMvc(option => option.EnableEndpointRouting = false);
             _moduleProvider.ConfigureServices(new ConfigurationContext(services,
                 _moduleProvider.Modules,
                 _moduleProvider.VirtualPaths,
@@ -122,10 +132,11 @@ namespace Surging.Core.KestrelHttpServer
             _moduleProvider.Initialize(new ApplicationInitializationContext(app, _moduleProvider.Modules,
                 _moduleProvider.VirtualPaths,
                 AppConfig.Configuration));
-            app.Run(async (context) =>
+            app.Use(async (context,next) =>
             {
                 var messageId = Guid.NewGuid().ToString("N");
-                var sender = new HttpServerMessageSender(_serializer, context);
+                var subject = new ReplaySubject<HttpResultMessage<object>>();
+                var sender = new HttpServerMessageSender(_serializer, context,_diagnosticListener, subject);
                 try
                 {
                     var filters = app.ApplicationServices.GetServices<IAuthorizationFilter>();
@@ -133,8 +144,9 @@ namespace Surging.Core.KestrelHttpServer
                     if (isSuccess)
                     {
                         var actionFilters = app.ApplicationServices.GetServices<IActionFilter>();
-                        await OnReceived(sender, messageId, context, actionFilters);
+                        await OnReceived(sender, messageId, context, actionFilters, subject);
                     }
+                    await next();
                 }
                 catch (Exception ex)
                 {
@@ -143,12 +155,12 @@ namespace Surging.Core.KestrelHttpServer
                     await OnException(context, sender, messageId, ex, filters);
                 }
             });
+            app.Run( context=> Task.CompletedTask);
         }
 
         private void WirteDiagnosticError(string messageId,Exception ex)
         {
-            var diagnosticListener = new DiagnosticListener(DiagnosticListenerExtensions.DiagnosticListenerName);
-            diagnosticListener.WriteTransportError(CPlatform.Diagnostics.TransportType.Rest, new TransportErrorEventData(new DiagnosticMessage
+            _diagnosticListener.WriteTransportError(CPlatform.Diagnostics.TransportType.Rest, new TransportErrorEventData(new DiagnosticMessage
             {
                 Id = messageId
             }, ex));
